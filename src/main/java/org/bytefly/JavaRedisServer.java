@@ -12,6 +12,19 @@ import java.util.*;
 
 public class JavaRedisServer {
 
+    /* Redis 内存淘汰策略 */
+    static int REDIS_MAXMEMORY_VOLATILE_LRU = 0;
+    static int REDIS_MAXMEMORY_VOLATILE_TTL = 1;
+    static int REDIS_MAXMEMORY_VOLATILE_RANDOM = 2;
+
+    static int REDIS_MAXMEMORY_ALLKEYS_LRU = 3;
+    static int REDIS_MAXMEMORY_ALLKEYS_RANDOM = 4;
+    static int REDIS_MAXMEMORY_NO_EVICTION = 5;
+    static int REDIS_DEFAULT_MAXMEMORY_POLICY = REDIS_MAXMEMORY_NO_EVICTION;
+
+    static long maxmemory = 3; // 模拟最大内存大小，键值对的数量
+    static int maxmemory_policy = REDIS_MAXMEMORY_ALLKEYS_LRU;
+
     // 16个db
     static RedisDB[] redisDb;
 
@@ -22,27 +35,51 @@ public class JavaRedisServer {
     static Selector selector;
     static HashMap<SelectionKey, RedisClient> clientMap = new HashMap<>();
 
-    // 每个db
-    static class RedisDB {
-        // 存储键值对
-        Dict dict = new Dict();
+    static class RedisObject {
+        int type; // 类型
+        int encoding; // 编码
 
-        // 键的过期时间，保存了所有键的过期时间 key = keyName， value = "expireTime"
-        Dict expires = new Dict();
+        long lru; // 最近一次被访问的时间戳
 
-        public Object get(String key) {
-            return dict.get(key);
+        int refcount; // 引用计数
+        Object value;
+
+        public RedisObject(Object value) {
+            this.lru = System.currentTimeMillis();
+            this.value = value;
         }
 
-        public void set(String key, Object value) {
-            dict.set(key, value);
+        @Override
+        public String toString() {
+            return "RedisObject{" +
+                    "type=" + type +
+                    ", encoding=" + encoding +
+                    ", lru=" + lru +
+                    ", refcount=" + refcount +
+                    ", value=" + value +
+                    '}';
         }
 
     }
 
+    /**
+     * 每秒执行的次数(执行频率)
+     */
+    static int hz = 10;
+
+    // 每个db
+    static class RedisDB {
+        // 存储键值对
+        public Dict<RedisObject> dict = new Dict();
+
+        // 键的过期时间，保存了所有键的过期时间 key = keyName， value = "expireTime"
+        public Dict<Long> expires = new Dict();
+
+    }
+
     // 字典
-    static class Dict {
-        Hashtable[] ht = new Hashtable[2];
+    static class Dict<T> {
+        Hashtable<String, T>[] ht = new Hashtable[2];
 
         {
             for (int i = 0; i < 2; i++) {
@@ -53,27 +90,67 @@ public class JavaRedisServer {
         // -1 表示没有正在进行渐进式hash
         int rehashinx = -1;
 
-        public Object get(String key) {
-            if (rehashinx == 1) {
-                // 正在进行渐进式 rehash，则需要判断ht[0]和ht[1]
-                Object o = ht[0].get(key);
-                if (o != null) {
-                    return o;
-                } else {
-                    return ht[1].get(key);
-                }
+
+        // 通用的代码
+        public void set(String key, T value) {
+            if (rehashinx == -1) {
+                ht[0].put(key, value); // 没有进行渐进式 rehash，则直接放入ht[0]中
             } else {
-                return ht[0].get(key);
+                ht[1].put(key, value); // 进行渐进式 rehash，则放入ht[1]中
             }
         }
 
-        public void set(String key, Object value) {
+        public void remove(String key) {
             if (rehashinx == -1) {
-                ht[0].put(key, value); // 没有进行渐进式hash
+                ht[0].remove(key); // 没有进行渐进式 rehash，则直接从ht[0]中删除
             } else {
-                ht[1].put(key, value); // 正在进行渐进式hash
+                ht[1].remove(key); // 没有进行渐进式 rehash，则从ht[1]中删除
             }
         }
+
+        public long getDictSize() {
+            return ht[0].size() + ht[1].size();
+        }
+
+        // dict的方法
+        public RedisObject getRedisObject(String key) {
+            if (rehashinx == -1) {
+                RedisObject redisObject = (RedisObject) ht[0].get(key);
+                if (redisObject != null) {
+                    return redisObject;
+                } else {
+                    return (RedisObject) ht[1].get(key);
+                }
+            } else {
+                return (RedisObject) ht[0].get(key);
+            }
+        }
+
+        /**
+         * 获取 key 值的 idle 时间
+         *
+         * @param key
+         * @return
+         */
+        public Long getIDLE(String key) {
+            RedisObject redisObject = this.getRedisObject(key);
+            return redisObject == null ? null : System.currentTimeMillis() - redisObject.lru;
+        }
+
+        // expire的方法
+        public Long getTTL(String key) {
+            if (rehashinx == 1) {
+                Long redisObject = (Long) ht[0].get(key);
+                if (redisObject != null) {
+                    return redisObject;
+                } else {
+                    return (Long) ht[1].get(key);
+                }
+            } else {
+                return (Long) ht[0].get(key);
+            }
+        }
+
     }
 
     static class RedisClient {
@@ -122,23 +199,29 @@ public class JavaRedisServer {
 
     }
 
+    public static long eventTime = System.currentTimeMillis();
+
+    // 高频函数，每次时间循环都会进入
+    public static void beforeSleep() {
+        activeExpireCycle(true); // 快速模式删除过期的 key
+
+        // flushAppendOnlyFile   将 AOF 缓冲区的内容写入到 AOF文件
+        // clusterBeforeSleep() 集群模式下执行
+
+    }
 
     public static void main(String[] args) throws IOException, InterruptedException {
         initServer();
 
         long nextEventTime = System.currentTimeMillis();
         while (true) {
-            long now = System.currentTimeMillis();
-            long timeout = 0;
-            if (now < nextEventTime) {
-                /**
-                 * 还未到达 下次时间事件
-                 * 计算超时时间 = 下次时间事件 - 当前时间
-                 */
-                timeout = nextEventTime - now;
-            } else if (now > nextEventTime) {
-                // 到达了，设置下次时间事件
-                nextEventTime = now + 100;
+
+            beforeSleep();
+            long now = System.currentTimeMillis(); // 当前时间
+            long timeout = eventTime - now; // 超时时间
+
+            if (timeout <= 0) {
+                timeout = 1;
             }
 
             // 处理文件事件
@@ -148,6 +231,7 @@ public class JavaRedisServer {
             if (now >= nextEventTime) {
                 // 定时任务，默认每秒执行 hz(10) 次
                 serverCron();
+                nextEventTime = now + 1000 / hz;
             }
         }
 
@@ -206,7 +290,7 @@ public class JavaRedisServer {
         System.out.println("接受连接:" + clients);
         clientChannel.configureBlocking(false);
 
-        /** 注册嘟事件 */
+        /** 注册读事件 */
         clientChannel.register(selector, SelectionKey.OP_READ, ByteBuffer.allocate(1024));
         redisClient.channel = clientChannel;
         redisClient.selectedDb = redisDb[0];
@@ -258,7 +342,12 @@ public class JavaRedisServer {
                 System.arraycopy(remaining, 0, client.queryBuf, 0, remaining.length);
                 client.queryBufLen = remaining.length;
 
-                Object result = doCommand(client, redisRequest);
+                Object result = null;
+                try {
+                    result = processCommand(client, redisRequest);
+                } catch (Exception e) {
+                    result = new ErrorObject("Err" + e.getMessage());
+                }
                 client.retValue = result;
                 client.write = true;
 
@@ -274,25 +363,323 @@ public class JavaRedisServer {
         }
     }
 
-    public static Object doCommand(RedisClient redisClient, RedisRequest request) {
+    public static Object lookupKeyRead(RedisDB db, String key) {
+        // 惰性删除
+        expireIfneeded(db, key);
+        return lookupKey(db, key);
+    }
+
+    /**
+     * 惰性删除
+     */
+    public static void expireIfneeded(RedisDB db, String key) {
+        Long expireTime = db.expires.getTTL(key);
+        if (expireTime != null) {
+            if (expireTime <= System.currentTimeMillis()) {
+                db.expires.remove(key);
+                db.dict.remove(key);
+            }
+        }
+    }
+
+    public static Object lookupKey(RedisDB db, String key) {
+        RedisObject redisObject = db.dict.getRedisObject(key);
+        if (redisObject != null) {
+            redisObject.lru = System.currentTimeMillis();
+            return redisObject.value;
+        }
+        return null;
+    }
+
+    public static Object processCommand(RedisClient redisClient, RedisRequest request) {
         System.out.println("handle command: " + request.command + " args: " + request.args);
 
+        RedisDB selectedDb = redisClient.selectedDb;
+
+        // 内存淘汰
+        if (maxmemory > 0) {
+            int rtval = freeMemoryIfNeeded();
+            if (rtval == -1 && isCmdDenyoom(request.command)) {
+                return new ErrorObject("OOM command not allowed when used memory > 'maxmemory'.");
+            }
+        }
+
+
+        return call(redisClient, request);
+    }
+
+    static long getDbSize() {
+        long size = 0;
+        for (int i = 0; i < redisDb.length; i++) {
+            size += redisDb[i].dict.getDictSize();
+        }
+        return size;
+    }
+
+    /**
+     * 如果需要，根据内存淘汰策略 释放内存
+     */
+    public static int freeMemoryIfNeeded() {
+        long dbSize = getDbSize();
+        if (dbSize < maxmemory) {
+            // 内存充足
+            return 0;
+        }
+
+        // 内存满了
+        if (maxmemory_policy == REDIS_MAXMEMORY_NO_EVICTION) {
+            return -1;
+        }
+
+        // 先计算要淘汰多少内存
+        long mem_tofree = dbSize - maxmemory;
+
+        int mem_freed = 0; // 已释放的内存
+
+        boolean keys_freed = false;
+
+        while (mem_freed < mem_tofree) {
+            for (int i = 0; i < redisDb.length; i++) {
+                Dict targetDict = null; // 目标字典
+
+                String deleteKey = null; // 删除的key
+                if (maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_RANDOM || maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_LRU) {
+                    targetDict = redisDb[i].dict;
+                } else {
+                    targetDict = redisDb[i].expires;
+                }
+
+                if (targetDict.getDictSize() == 0) {
+                    continue;
+                }
+
+                // Random 策略
+                if (maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_RANDOM || maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_RANDOM) {
+                    deleteKey = dictGetRandomKey(targetDict);
+                }
+                // LRU 策略
+                else if (maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_LRU || maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_LRU) {
+                    // LRU策略
+                    // 那么从一集 sample 键中选出 IDLE 事件最长的那个键
+                    // LRU策略：随机采样 server.maxmemory_samples 个键，选其中idle时间最长的（即最近最少使用）
+                    int samplesCount = 5; // 默认采样集合大小
+                    String bestKey = null; // 最佳键
+                    long minIDLE = Long.MAX_VALUE;
+                    for (int j = 0; j < samplesCount; j++) {
+                        String key = dictGetRandomKey(targetDict);
+                        if (key == null) {
+                            continue;
+                        }
+
+                        // 重点:从主字典（redisDb[i].dict）获取idle时间（不是从expires字典！）
+                        Long idle = redisDb[i].dict.getIDLE(key);
+                        if (idle < minIDLE) {
+                            minIDLE = idle;
+                            bestKey = key;
+                        }
+                    }
+                    if (bestKey != null) {
+                        deleteKey = bestKey;
+                    }
+
+                }
+                // ttl 策略
+                else if (maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_TTL) {
+                    // TTL策略
+                    // 随机从过期键中选取5个键，然后选一个ttl最短的键    ### 并不是吧所有的进行排序 ###
+                    String tempKey = null;
+                    long tempTTL = Long.MAX_VALUE;
+                    for (int j = 0; j < 5; j++) {
+                        String randomKey = dictGetRandomKey(targetDict);
+                        long ttl = targetDict.getTTL(randomKey);
+                        if (ttl < tempTTL) {
+                            tempKey = randomKey;
+                            tempTTL = ttl;
+                        }
+                    }
+                    deleteKey = tempKey;
+                }
+
+                if (deleteKey != null) {
+                    System.out.println("######## 内存淘汰，策略" + maxmemory_policy + "，删除键" + deleteKey + "########");
+                    // 删除键
+                    keys_freed = true;
+                    redisDb[i].dict.remove(deleteKey);
+                    redisDb[i].expires.remove(deleteKey);
+                    mem_tofree += 1;
+                }
+            }
+            if (!keys_freed) {
+                // 没有被释放，说明内存已满，但是没有满足策略的键
+                return -1;
+            }
+        }
+        return mem_freed;
+    }
+
+    // 如果内存淘汰失败，且是 修改类型的命令
+    private static boolean isCmdDenyoom(String command) {
+        return "set".equalsIgnoreCase(command) || "setex".equalsIgnoreCase(command) || "mset".equalsIgnoreCase(command) || "msetnx".equalsIgnoreCase(command);
+    }
+
+    // 获取一个随机键
+    public static String dictGetRandomKey(Dict dict) {
+        if (dict.getDictSize() == 0) {
+            return null;
+        }
+        List<String> keysArray = null;
+        if (dict.rehashinx == -1) {
+            keysArray = new ArrayList<>(dict.ht[0].keySet());
+        } else {
+            keysArray = new ArrayList<>(dict.ht[0].keySet());
+            List<String> keysArray1 = new ArrayList<>(dict.ht[1].keySet());
+            keysArray.addAll(keysArray1);
+        }
+
+        Random random = new Random();
+        int index = random.nextInt(keysArray.size());
+        return keysArray.get(index);
+    }
+
+    public static Object call(RedisClient redisClient, RedisRequest request) {
+        RedisDB selectedDb = redisClient.selectedDb;
+
+        if ("expire".equalsIgnoreCase(request.command)) {
+            RedisObject redisObject = selectedDb.dict.getRedisObject(request.args.get(0));
+            if (redisObject == null) {
+                return 0;
+            }
+            long l = Long.parseLong(request.args.get(1)); // 偏移时间，秒
+            long expireTime = System.currentTimeMillis() + l * 1000;
+            selectedDb.expires.set(request.args.get(0), expireTime);
+            return 1;
+        }
+        if ("ttl".equalsIgnoreCase(request.command)) {
+            Long ttl = selectedDb.expires.getTTL(request.args.get(0));
+            if (ttl == null) {
+                return "-1";
+            }
+            long l = ((long) ttl - System.currentTimeMillis()) / 1000;
+            return Long.valueOf(l).toString();
+        }
+
         if ("get".equalsIgnoreCase(request.command)) {
-            return redisClient.selectedDb.get(request.args.get(0));
-        } else if ("Set".equalsIgnoreCase(request.command)) {
-            redisClient.selectedDb.set(request.args.get(0), request.args.get(1));
+            return lookupKeyRead(selectedDb, request.args.get(0));
+        }
+        if ("Set".equalsIgnoreCase(request.command)) {
+            RedisObject redisObject = new RedisObject(request.args.get(1));
+            selectedDb.dict.set(request.args.get(0), redisObject);
             return "OK";
-        } else if ("select".equalsIgnoreCase(request.command)) {
+        }
+        if ("select".equalsIgnoreCase(request.command)) {
             int dbIndex = Integer.parseInt(request.args.get(0));
             if (dbIndex < 0 | dbIndex >= redisDb.length) {
                 return "ERR invalid DB index";
             }
             redisClient.selectedDb = redisDb[dbIndex];
             return "OK";
-        } else if ("auth".equalsIgnoreCase(request.command)) {
-
+        }
+        if ("auth".equalsIgnoreCase(request.command)) {
+            return "OK";
+        }
+        if ("ping".equalsIgnoreCase(request.command)) {
+            return "PONG";
+        }
+        if ("info".equalsIgnoreCase(request.command)) {
+            return infoResponse;
+        }
+        if ("hello".equalsIgnoreCase(request.command)) {
+            return new ErrorObject("ERR unknown command 'HELLO'");
+        }
+        if ("keys".equalsIgnoreCase(request.command)) {
+            List<String> list = new ArrayList<>();
+            // 匹配模式
+            String pattern = request.args.get(0);
+            for (RedisDB redisDB : redisDb) {
+                // TODO 判断是否过期
+                for (String getkey : redisDB.dict.ht[0].keySet()) {
+                    if (isMatch(getkey, pattern)) {
+                        list.add(getkey);
+                    }
+                }
+                if (redisDB.dict.rehashinx != -1) {
+                    for (String getKey : redisDB.dict.ht[1].keySet()) {
+                        if (isMatch(getKey, pattern)) {
+                            list.add(getKey);
+                        }
+                    }
+                }
+            }
+            return list.toString();
         }
         return "ERR unknown command '" + request.command + "'";
+    }
+
+    /**
+     * 使用动态规划实现通配符匹配
+     * 参考自 LeetCode 44.通配符匹配的解题思路
+     * 检查字符串是否匹配给定的通配符模式
+     *
+     * @param s 待匹配的字符串（例如一个Redis key）
+     * @param p 包含通配符的模式字符串（例如"abc*"）
+     * @return 如果字符串s完全匹配模式p，返回true，否则返回false
+     */
+    public static boolean isMatch(String s, String p) {
+        int sLen = s.length();
+        int pLen = p.length();
+
+        // dp[i][j] 表示：s 的前 i 个字符是否与 p 的前 j 个字符匹配
+        boolean[][] dp = new boolean[sLen + 1][pLen + 1];
+
+        // 基础情况：两个空字符串匹配
+        dp[0][0] = true;
+
+        // 处理模式p开头是连续*的情况：*可以匹配空字符串
+        for (int j = 1; j <= pLen; j++) {
+            if (p.charAt(j - 1) == '*') {
+                dp[0][j] = dp[0][j - 1]; // 当前状态依赖于前一个状态
+            } else {
+                // 遇到非*字符，后续不可能再匹配空字符串，直接跳出循环
+                break;
+            }
+        }
+
+        // 填充dp数组
+        for (int i = 1; i <= sLen; i++) {
+            for (int j = 1; j <= pLen; j++) {
+                char charOfP = p.charAt(j - 1);
+
+                if (charOfP == '*') {
+                    // 当遇到'*'时,有两种情况可以使dp[i][j]为true:
+                    // 1. 忽略'*'（即*匹配空串）：dp[i][j-1]
+                    // 2. 使用'*'匹配当前字符串s[i-1],并继续尝试使用这个'*'匹配s中更前面的字符：dp[i-1][j]
+                    dp[i][j] = dp[i - 1][j] || dp[i][j - 1];
+                } else {
+                    // 当字符精确匹配，该模式中是'?'时，当前字符匹配成功
+                    // 并且前名单字符也需匹配成功
+                    if (charOfP == '?' || charOfP == s.charAt(i - 1)) {
+                        dp[i][j] = dp[i - 1][j - 1];
+                    }
+                    // 否则，dp[i][j]保持默认的false
+                }
+            }
+        }
+        return dp[sLen][pLen];
+    }
+
+    /**
+     * 返回错误信息
+     */
+    static class ErrorObject {
+        String message;
+
+        ErrorObject(String message) {
+            this.message = message;
+        }
+
+        public String getMessage() {
+            return message;
+        }
     }
 
     /**
@@ -327,6 +714,8 @@ public class JavaRedisServer {
             client.outBuf = RespUtil.formatInteger((Integer) client.retValue);
         } else if (client.retValue instanceof Throwable) {
             client.outBuf = RespUtil.formatError(((Throwable) client.retValue).getMessage());
+        } else if (client.retValue instanceof ErrorObject) {
+            client.outBuf = RespUtil.formatError(((ErrorObject) client.retValue).message);
         }
         // ===============================================
         ByteBuffer buffer = ByteBuffer.wrap(client.outBuf);
@@ -344,12 +733,12 @@ public class JavaRedisServer {
                 // 分片写入优化
                 if (totalWritten < client.outBuf.length) {
                     client.outBuf = Arrays.copyOfRange(
-                            client.outBuf,totalWritten,client.outBuf.length
+                            client.outBuf, totalWritten, client.outBuf.length
                     );
                 }
                 key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);
                 client.write = true;
-            }else{
+            } else {
                 // 状态清零与事件切换
                 // client.outBuf = null;
                 client.retValue = null;
@@ -391,6 +780,112 @@ public class JavaRedisServer {
          * 9. 数据统计，慢查询日志等
          */
         Thread.sleep(10);
+
+        activeExpireCycle(false);
     }
+
+    // 过期键的删除，主动删除
+    public static void activeExpireCycle(boolean flag) {
+        /**
+         * 1. 要控制这个函数需要跑多久
+         * 2. 要控制每次删除键的数量
+         */
+        // 假设最多跑 10000 个键值对，最多 50ms
+        long endTime = System.currentTimeMillis() + 50; // 截止时间
+        long maxSum = 10000; // 最大 10000
+
+        if (flag) {
+            endTime = System.currentTimeMillis() + 10;
+            maxSum = 1000;
+        }
+
+        long sum = 0; // 删除的键值对数量
+        for (RedisDB db : redisDb) {
+            long dbSize = db.dict.getDictSize();
+            if (dbSize == 0) {
+                continue;
+            }
+
+            for (Object entry : db.expires.ht[0].entrySet()) {
+                Map.Entry entry1 = (Map.Entry) entry;
+                String key = (String) entry1.getKey();
+                long expireTime = (Long) entry1.getValue();
+
+                // 判断是否过期
+                if (expireTime <= System.currentTimeMillis()) {
+                    // 打印
+                    RedisObject redisObject = db.dict.getRedisObject(key);
+                    System.out.println("过期键主动淘汰:" + key + " value:" + (redisObject != null ? redisObject.toString() : "null"));
+
+                    // 删除
+                    db.dict.remove(key);
+                    db.expires.remove(key);
+
+                    sum++;
+                    if (sum >= maxSum || System.currentTimeMillis() > endTime) {
+                        return;
+                    }
+                }
+            }
+
+        }
+    }
+
+    static String infoResponse = "#Server\r\n" +
+            "redis_version:7.0.0\r\n" +
+            "redis_mode:standalone\r\n" +
+            "os:Linux 5.4.0 x86_64\r\n" +
+            "arch_bits:64\r\n" +
+            "multiplexing_api:epoll\r\n" +
+            "process_id:12345\r\n" +
+            "run_id:abc123def456\r\n" + // 模拟运行ID
+            "tcp_port:6379\r\n" +
+            "uptime_in_seconds:1000\r\n" +
+            "uptime_in_days:0\r\n" +
+            "hz:10\r\n" +
+            "config_file:/path/to/redis.config\r\n" +
+            "\r\n" +
+            "# Clients\r\n" +
+            "connect_clients:1\r\n" +
+            "client_recent_max_input_buffer:2\r\n" +
+            "blocked_clients:0\r\n" +
+            "\r\n" +
+            "# Memory\r\n" +
+            "user_memory:1048576\r\n" +
+            "user_memory_human:1.00M\r\n" +
+            "user_memory_rss_2097152\r\n" +
+            "user_memory_peak:2097152\r\n" +
+            "user_memory_peak_oerc:50.00%\r\n" +
+            "mem_fragmentation_ratio:2.00\r\n" +
+            "maxmemory:0\r\n" +
+            "maxmemory_policy:noeviction\r\n" +
+            "mem_allocator:jemalloc-5.2.1\r\n" +
+            "\r\n" +
+            "# Persistence\r\n" +
+            "loading:0\r\n" +
+            "rdb_changes_since_last_save:0\r\n" +
+            "rdb_bgsave_in_progress:0\r\n" +
+            "aof_enabled:0\r\n" +
+            "\r\n" +
+            "# Stats\r\n" +
+            "total_connections_received:5\r\n" +
+            "total_commands_processed:100\r\n" +
+            "instantaneous_ops_per_sec:0\r\n" +
+            "rejected_connections:0\r\n" +
+            "keyspace_hits:50\r\n" +
+            "keyspace_misses:10\r\n" +
+            "\r\n" +
+            "# Replication\r\n" +
+            "role:master\r\n" +
+            "connected_slaves:0\r\n" +
+            "master_repl_offset:0\r\n" +
+            "\r\n" +
+            "# CPU\r\n" +
+            "used_cpu_sys:10.5\r\n" +
+            "used_cpu_user:20.3\r\n" +
+            "\r\n" +
+            "# Keyspace\r\n" +
+            "db0:keys=10,expires=0,avg_ttl=0\r\n";
+
 
 }
