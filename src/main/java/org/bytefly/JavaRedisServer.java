@@ -75,6 +75,16 @@ public class JavaRedisServer {
         // 键的过期时间，保存了所有键的过期时间 key = keyName， value = "expireTime"
         public Dict<Long> expires = new Dict();
 
+        public int id; // db的索引
+
+        public List<WatchKeyClient> watched_keys = new ArrayList<>();
+
+        public static class WatchKeyClient {
+            RedisClient client;
+            String key;
+        }
+
+
     }
 
     // 字典
@@ -173,6 +183,26 @@ public class JavaRedisServer {
         boolean read; // 是否可读
         boolean write; // 是否可写
         boolean accept; // 是否课接受连接
+
+        /**
+         * 客户端状态
+         * 0: salve
+         * 1: master
+         * 2: slave monitor
+         * 3: multi   事务中   ###
+         * 4: blocked
+         * 5: watched key modified  ###
+         * 等等
+         */
+        int flag = 0;
+        Multi.MultiState multiState; // 保存事务相关的数据
+
+        List<WatchKey> watched_keys = new ArrayList<>();
+
+        public static class WatchKey {
+            String key; // key
+            int db; // db的索引
+        }
 
         // 将 ByteBuffer 中的数据值追加到 queryBuf 中
         public void appendToQueryBuf(ByteBuffer buffer) {
@@ -396,6 +426,8 @@ public class JavaRedisServer {
 
         RedisDB selectedDb = redisClient.selectedDb;
 
+        String command = request.command;
+
         // 内存淘汰
         if (maxmemory > 0) {
             int rtval = freeMemoryIfNeeded();
@@ -404,6 +436,10 @@ public class JavaRedisServer {
             }
         }
 
+        if (redisClient.flag == 3 && !command.equalsIgnoreCase(Multi.MULTI) && !command.equalsIgnoreCase(Multi.DISCARD) && !command.equalsIgnoreCase(Multi.WATCH) && !command.equalsIgnoreCase(Multi.EXEC)) {
+            Multi.queueMultiCommand(redisClient, request);
+            return "OK";
+        }
 
         return call(redisClient, request);
     }
@@ -544,6 +580,28 @@ public class JavaRedisServer {
     public static Object call(RedisClient redisClient, RedisRequest request) {
         RedisDB selectedDb = redisClient.selectedDb;
 
+        // 开启事务
+        if ("multi".equalsIgnoreCase(request.command)) {
+            return Multi.multi(redisClient);
+        }
+
+        if ("discard".equalsIgnoreCase(request.command)) {
+            return Multi.discard(redisClient);
+        }
+
+        // 执行事务
+        if ("exec".equalsIgnoreCase(request.command)) {
+            return Multi.exec(redisClient, request);
+        }
+
+        if ("watch".equalsIgnoreCase(request.command)) {
+           return Multi.watch(redisClient, request);
+        }
+
+        if ("unwatch".equalsIgnoreCase(request.command)) {
+            return Multi.unwatch(redisClient);
+        }
+
         if ("expire".equalsIgnoreCase(request.command)) {
             RedisObject redisObject = selectedDb.dict.getRedisObject(request.args.get(0));
             if (redisObject == null) {
@@ -566,9 +624,12 @@ public class JavaRedisServer {
         if ("get".equalsIgnoreCase(request.command)) {
             return lookupKeyRead(selectedDb, request.args.get(0));
         }
-        if ("Set".equalsIgnoreCase(request.command)) {
+        if ("set".equalsIgnoreCase(request.command)) {
             RedisObject redisObject = new RedisObject(request.args.get(1));
             selectedDb.dict.set(request.args.get(0), redisObject);
+
+            Multi.touchWatchedKeys(redisClient,request);
+
             return "OK";
         }
         if ("select".equalsIgnoreCase(request.command)) {
