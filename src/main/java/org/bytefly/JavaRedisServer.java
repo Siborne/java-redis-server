@@ -31,6 +31,9 @@ public class JavaRedisServer {
     // 客户端链接集合
     static List<RedisClient> clients = new ArrayList<>();
 
+    // 订阅频道
+    static Map<String, List<RedisClient>> pubsub_channels = new HashMap<>();
+
     static ServerSocketChannel serverSocketChannel;
     static Selector selector;
     static HashMap<SelectionKey, RedisClient> clientMap = new HashMap<>();
@@ -595,11 +598,46 @@ public class JavaRedisServer {
         }
 
         if ("watch".equalsIgnoreCase(request.command)) {
-           return Multi.watch(redisClient, request);
+            return Multi.watch(redisClient, request);
         }
 
         if ("unwatch".equalsIgnoreCase(request.command)) {
             return Multi.unwatch(redisClient);
+        }
+
+        /**
+         * subscribe test1 test2
+         */
+        // subscribe
+        // 订阅
+        if ("subscribe".equalsIgnoreCase(request.command)) {
+            for (String channel : request.args) {
+                List<RedisClient> redisClients = pubsub_channels.get(channel);
+                if (redisClients == null) {
+                    redisClients = new ArrayList<>();
+                    pubsub_channels.put(channel, redisClients);
+                }
+                redisClients.add(redisClient); // 添加订阅者 - 当前客户端
+            }
+            return new ArrayObject("subscribe", request.args.get(0), 1);
+        }
+
+        // 发布 publish test1 "hello world"
+        if ("publish".equalsIgnoreCase(request.command)) {
+            String channel = request.args.get(0);
+            String message = request.args.get(1);
+            List<RedisClient> redisClients = pubsub_channels.get(channel);
+            if (redisClients != null) {
+                for (RedisClient client : redisClients) {
+                    client.retValue = message;
+                    client.write = true;
+
+                    // 注册可写事件
+                    SelectionKey key2 = client.channel.keyFor(selector);
+                    key2.interestOps(key2.interestOps() | SelectionKey.OP_WRITE);
+                }
+            }
+            return Long.valueOf(redisClients.size()).toString();
         }
 
         if ("expire".equalsIgnoreCase(request.command)) {
@@ -628,7 +666,7 @@ public class JavaRedisServer {
             RedisObject redisObject = new RedisObject(request.args.get(1));
             selectedDb.dict.set(request.args.get(0), redisObject);
 
-            Multi.touchWatchedKeys(redisClient,request);
+            Multi.touchWatchedKeys(redisClient, request);
 
             return "OK";
         }
@@ -777,6 +815,9 @@ public class JavaRedisServer {
             client.outBuf = RespUtil.formatError(((Throwable) client.retValue).getMessage());
         } else if (client.retValue instanceof ErrorObject) {
             client.outBuf = RespUtil.formatError(((ErrorObject) client.retValue).message);
+        } else if (client.retValue instanceof ArrayObject) {
+            ArrayObject retValue2 = (ArrayObject) client.retValue;
+            client.outBuf = RespUtil.formatArray(retValue2.elements);
         }
         // ===============================================
         ByteBuffer buffer = ByteBuffer.wrap(client.outBuf);
@@ -947,6 +988,14 @@ public class JavaRedisServer {
             "\r\n" +
             "# Keyspace\r\n" +
             "db0:keys=10,expires=0,avg_ttl=0\r\n";
+
+    static class ArrayObject {
+        Object[] elements;
+
+        ArrayObject(Object... elements) {
+            this.elements = elements;
+        }
+    }
 
 
 }

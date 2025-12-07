@@ -1,5 +1,7 @@
 package org.bytefly;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -129,4 +131,45 @@ public class RespUtil {
         String head = "$" + data.length + "\r\n";
         return (head + value + "\r\n").getBytes(StandardCharsets.UTF_8);
     }
+
+    // ============= 数组回复格式化方法 =============
+    static byte[] formatArray(Object... elements) {
+        if (elements == null) {
+            return "*0\r\n".getBytes(StandardCharsets.UTF_8);
+        }
+
+        try {
+            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+
+            // 写入数组头：*<元素个数>\r\n
+            String arrayHeader = "*" + elements.length + "\r\n";
+            outputStream.write(arrayHeader.getBytes(StandardCharsets.UTF_8));
+
+            // 遍历并格式化每个元素
+            for (Object element : elements) {
+                if (element instanceof String) {
+                    // 字符串按 Bulk String 处理
+                    outputStream.write(formatBulkString((String) element));
+                } else if (element instanceof Integer) {
+                    // 整数按 Integer 处理
+                    outputStream.write(formatInteger((Integer) element));
+                } else if (element instanceof byte[]) {
+                    // 已经是字节数组的直接写入（支持已格式化的 RESP 数据）
+                    outputStream.write((byte[]) element);
+                } else if (element == null) {
+                    // null 值按 Null Bulk String 处理
+                    outputStream.write("$-1\r\n".getBytes(StandardCharsets.UTF_8));
+                } else {
+                    throw new IllegalArgumentException("Unsupported element type: " + element.getClass());
+                }
+            }
+
+            return outputStream.toByteArray();
+
+        } catch (IOException e) {
+            // 理论上不会发生，因为 ByteArrayOutputStream 不会抛出 IOException
+            throw new RuntimeException("Failed to format array", e);
+        }
+    }
+
 }
