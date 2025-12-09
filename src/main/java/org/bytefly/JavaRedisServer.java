@@ -757,6 +757,78 @@ public class JavaRedisServer {
             }
         }
 
+        // zset
+        if ("zadd".equalsIgnoreCase(request.command)) {
+            RedisObject redisObject = selectedDb.dict.getRedisObject(key);
+            if (redisObject != null && redisObject.type != RedisConstants.REDIS_ZSET) {
+                return new ErrorObject("WRONGTYPE Operation against a key holding the wrong kind of value");
+            }
+            ScoredSkipList<Object> scoredSkipList = null;
+            if (redisObject == null) {
+                scoredSkipList = new ScoredSkipList<>();
+                redisObject = new RedisObject(scoredSkipList);
+                redisObject.type = RedisConstants.REDIS_ZSET; // 设置类型
+                redisObject.encoding = RedisConstants.REDIS_ENCODING_SKIPLIST;
+                selectedDb.dict.set(key, redisObject);
+            } else {
+                scoredSkipList = (ScoredSkipList) redisObject.value;
+            }
+            /*scoredSkipList.insert(Double.parseDouble(request.args.get(1)), request.args.get(2));
+            return Long.valueOf(1);*/
+            for (int i = 1; i < request.args.size() && i + 1 < request.args.size(); i += 2) {
+                double score = Double.parseDouble(request.args.get(i));
+                Object value = request.args.get(i + 1);
+                scoredSkipList.insert(score, value);
+            }
+
+            return Long.valueOf((request.args.size() - 1) / 2);
+        }
+        if ("zrange".equalsIgnoreCase(request.command)) {
+            RedisObject redisObject = selectedDb.dict.getRedisObject(key);
+            if (redisObject != null && redisObject.type != RedisConstants.REDIS_ZSET) {
+                return new ErrorObject("WRONGTYPE Operation against a key holding the wrong kind of value");
+            }
+            if (redisObject == null) {
+                return new ArrayObject();
+            }
+            ScoredSkipList<Object> scoredSkipList = (ScoredSkipList) redisObject.value;
+            List<ScoredSkipList.SkipListNode<Object>> list = scoredSkipList.rangeByScore(Double.parseDouble(request.args.get(1)), Double.parseDouble(request.args.get(2)));
+            return new JavaRedisServer.ArrayObject(list.stream().map(ScoredSkipList.SkipListNode::getValue).toArray());
+        }
+
+     /*   if ("zadd".equalsIgnoreCase(request.command)) {
+            JavaRedisServer.RedisObject redisObject = selectedDb.dict.getRedisObject(key);
+            if (Objects.nonNull(redisObject) && redisObject.type != RedisConstants.REDIS_ZSET) {
+                return new JavaRedisServer.ErrorObject("WRONGTYPE Operation against a key holding the wrong kind of value");
+            }
+
+            ScoredSkipList<Object> skipList;
+            if (redisObject == null) {
+                skipList = new ScoredSkipList<>();
+                redisObject = new JavaRedisServer.RedisObject(skipList);
+                redisObject.type = RedisConstants.REDIS_ZSET;
+                redisObject.encoding = RedisConstants.REDIS_ENCODING_SKIPLIST;
+                selectedDb.dict.set(key, redisObject);
+            }else{
+                skipList = (ScoredSkipList<Object>) redisObject.value;
+            }
+            skipList.insert(Double.parseDouble(request.args.get(1)), request.args.get(2));
+            return Long.valueOf(1);
+        }
+
+        if ("zrange".equalsIgnoreCase(request.command)) {
+            JavaRedisServer.RedisObject redisObject = selectedDb.dict.getRedisObject(key);
+            if (Objects.nonNull(redisObject) && redisObject.type != RedisConstants.REDIS_ZSET) {
+                return new JavaRedisServer.ErrorObject("WRONGTYPE Operation against a key holding the wrong kind of value");
+            }
+
+            ScoredSkipList<Object> scoredSkipList = (ScoredSkipList<Object>) redisObject.value;
+
+            List<ScoredSkipList.SkipListNode<Object>> skipListNodes = scoredSkipList.rangeByScore(Double.parseDouble(request.args.get(1)), Double.parseDouble(request.args.get(2)));
+
+            return new JavaRedisServer.ArrayObject(skipListNodes.stream().map(ScoredSkipList.SkipListNode::getValue).toArray());
+        }*/
+
         if ("get".equalsIgnoreCase(request.command)) {
             return lookupKeyRead(selectedDb, key);
         }
