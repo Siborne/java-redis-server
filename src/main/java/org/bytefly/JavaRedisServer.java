@@ -680,21 +680,21 @@ public class JavaRedisServer {
             if (redisObject != null && redisObject.type != RedisConstants.REDIS_LIST) {
                 return new ErrorObject("WRONGTYPE Operation against a key holding the wrong kind of value");
             }
-//            if (redisObject == null) {
-//                ZipList zipList = new ZipList();
-//                redisObject = new RedisObject(zipList);
-//                redisObject.type = RedisConstants.REDIS_LIST;
-//                redisObject.encoding = RedisConstants.REDIS_ENCODING_ZIPLIST;
-//                selectedDb.dict.set(key, redisObject);
-//            }
-
             if (redisObject == null) {
-                LinkedList zipList = new LinkedList<>();
+                ZipList zipList = new ZipList();
                 redisObject = new RedisObject(zipList);
                 redisObject.type = RedisConstants.REDIS_LIST;
-                redisObject.encoding = RedisConstants.REDIS_ENCODING_LINKEDLIST;
+                redisObject.encoding = RedisConstants.REDIS_ENCODING_ZIPLIST;
                 selectedDb.dict.set(key, redisObject);
             }
+
+//            if (redisObject == null) {
+//                LinkedList zipList = new LinkedList<>();
+//                redisObject = new RedisObject(zipList);
+//                redisObject.type = RedisConstants.REDIS_LIST;
+//                redisObject.encoding = RedisConstants.REDIS_ENCODING_LINKEDLIST;
+//                selectedDb.dict.set(key, redisObject);
+//            }
             int count = 0;
             for (String value : request.args.subList(1, request.args.size())) {
                 listTypePush(redisObject, value, true);
@@ -1032,6 +1032,10 @@ public class JavaRedisServer {
                     // 注册可写   事件
                     SelectionKey key = client.channel.keyFor(selector);
                     key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);
+
+                    client.flags = 0;
+                    client.bpop = null;
+
                 }
             }
         }
